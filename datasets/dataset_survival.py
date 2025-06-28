@@ -24,6 +24,7 @@ class Generic_WSI_Survival_Dataset(Dataset):
         patient_strat=False, label_col = None, filter_dict = {}, eps=1e-6):
         r"""
         Generic_WSI_Survival_Dataset 
+  
 
         Args:
             csv_file (string): Path to the csv file with annotations.
@@ -33,6 +34,7 @@ class Generic_WSI_Survival_Dataset(Dataset):
             label_dict (dict): Dictionary with key, value pairs for converting str labels to int
             ignore (list): List containing class labels to ignore
         """
+        slide_data = pd.read_csv(csv_path, low_memory=False)
         self.custom_test_ids = None
         self.seed = seed
         self.print_info = print_info
@@ -44,10 +46,11 @@ class Generic_WSI_Survival_Dataset(Dataset):
             np.random.seed(seed)
             np.random.shuffle(slide_data)
 
-        slide_data = pd.read_csv(csv_path, low_memory=False)
+        
         #slide_data = slide_data.drop(['Unnamed: 0'], axis=1)
         if 'case_id' not in slide_data:
-            slide_data.index = slide_data.index.str[:12]
+            slide_data.index = slide_data.index.astype(str).str[:12]
+
             slide_data['case_id'] = slide_data.index
             slide_data = slide_data.reset_index(drop=True)
 
@@ -111,6 +114,7 @@ class Generic_WSI_Survival_Dataset(Dataset):
         new_cols = list(slide_data.columns[-1:]) + list(slide_data.columns[:-1])  ### PORPOISE
         slide_data = slide_data[new_cols]
         self.slide_data = slide_data
+     
         metadata = ['disc_label', 'Unnamed: 0', 'case_id', 'label', 'slide_id', 'age', 'site', 'survival_months', 'censorship', 'is_female', 'oncotree_code', 'train']
         self.metadata = slide_data.columns[:12]
         

@@ -131,6 +131,7 @@ parser.add_argument('--path_input_dim', type=int, default=1024)
 parser.add_argument('--use_mlp', action='store_true', default=False)
 
 
+
 ### Optimizer Parameters + Survival Loss Function
 parser.add_argument('--opt',             type=str, choices = ['adam', 'sgd'], default='adam')
 parser.add_argument('--batch_size',      type=int, default=1, help='Batch Size (Default: 1, due to varying bag sizes)')
@@ -143,7 +144,7 @@ parser.add_argument('--reg', 			 type=float, default=1e-5, help='L2-regularizati
 parser.add_argument('--alpha_surv',      type=float, default=0.0, help='How much to weigh uncensored patients')
 parser.add_argument('--reg_type',        type=str, choices=['None', 'omic', 'pathomic'], default='None', help='Which network submodules to apply L1-Regularization (default: None)')
 parser.add_argument('--lambda_reg',      type=float, default=1e-5, help='L1-Regularization Strength (Default 1e-4)')
-parser.add_argument('--weighted_sample', action='store_true', default=True, help='Enable weighted sampling')
+parser.add_argument('--weighted_sample', action='store_true', default=False, help='Enable weighted sampling')
 parser.add_argument('--early_stopping',  action='store_true', default=False, help='Enable early stopping')
 
 ### CLAM-Specific Parameters
@@ -153,9 +154,10 @@ parser.add_argument('--testing', 	 	 action='store_true', default=False, help='d
 args = parser.parse_args()
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 ### Creates Experiment Code from argparse + Folder Name to Save Results
 args = get_custom_exp_code(args)
-args.task = '_'.join(args.split_dir.split('_')[:2]) + '_survival'
+args.task = args.split_dir    
 print("Experiment Name:", args.exp_code)
 
 ### Sets Seed for reproducible experiments.
@@ -196,7 +198,27 @@ settings = {'num_splits': args.k,
 			'opt': args.opt}
 print('\nLoad Dataset')
 
-if 'survival' in args.task:
+
+	
+if args.task == 'my_brca_survival':
+    args.n_classes = 4
+    csv_path    = '/Users/tianyigao/PORPOISE/datasets_csv/my_brca_all.csv'
+    feature_dir = '/Users/tianyigao/porpoise_data/features/tcga_blca_20x_features'
+
+    dataset = Generic_MIL_Survival_Dataset(
+        csv_path      = csv_path,
+        mode          = args.mode,
+        data_dir      = feature_dir,
+        shuffle       = False,
+        seed          = args.seed,
+        print_info    = True,
+        patient_strat = False,
+        n_bins        = 4,
+        label_col     = 'survival_months',
+        ignore        = []
+    )
+
+elif args.split_dir.startswith('tcga_'):
 	study = '_'.join(args.task.split('_')[:2])
 	if study == 'tcga_kirc' or study == 'tcga_kirp':
 		combined_study = 'tcga_kidney'
@@ -207,7 +229,7 @@ if 'survival' in args.task:
 	
 	study_dir = '%s_20x_features' % combined_study
 
-	dataset = Generic_MIL_Survival_Dataset(csv_path = './%s/%s_all_clean.csv.zip' % (args.dataset_path, study),
+	dataset = Generic_MIL_Survival_Dataset( csv_path = '/Users/tianyigao/PORPOISE/datasets_csv/my_brca.csv',
 										   mode = args.mode,
 										   apply_sig = args.apply_sig,
 										   data_dir= os.path.join(args.data_root_dir, study_dir),
@@ -218,6 +240,9 @@ if 'survival' in args.task:
 										   n_bins=4,
 										   label_col = 'survival_months',
 										   ignore=[])
+
+
+
 else:
 	raise NotImplementedError
 

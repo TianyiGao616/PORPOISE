@@ -13,7 +13,8 @@ from datasets.dataset_generic import save_splits
 from models.model_genomic import SNN
 from models.model_set_mil import MIL_Sum_FC_surv, MIL_Attention_FC_surv, MIL_Cluster_FC_surv
 from models.model_coattn import MCAT_Surv
-from models.model_porpoise import PorpoiseMMF, PorpoiseAMIL, PorpoiseMMF_Fast
+from models.model_porpoise import PorpoiseMMF, PorpoiseAMIL
+# PorpoiseMMF_Fast was removed or not implemented
 from utils.utils import *
 from utils.loss_func import NLLSurvLoss
 
@@ -220,158 +221,176 @@ def train(datasets: tuple, cur: int, args: Namespace):
     return results_val_dict, val_cindex
 
 
-def train_loop_survival(epoch, model, loader, optimizer, n_classes, writer=None, loss_fn=None, reg_fn=None, lambda_reg=0., gc=16):   
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+def train_loop_survival(epoch, model, loader, optimizer, n_classes,
+                        writer=None, loss_fn=None, reg_fn=None,
+                        lambda_reg=0., gc=16):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.train()
+
     train_loss_surv, train_loss = 0., 0.
+    all_risk_scores, all_censorships, all_event_times = [], [], []
 
-    print('\n')
-    #all_risk_scores = np.zeros((len(loader)))
-    #all_censorships = np.zeros((len(loader)))
-    #all_event_times = np.zeros((len(loader)))
-    all_risk_scores = []
-    all_censorships = []
-    all_event_times = []
+    print()
 
-    for batch_idx, (data_WSI, data_omic, y_disc, event_time, censor) in enumerate(loader):
-        
-        data_WSI, data_omic = data_WSI.to(device), data_omic.to(device)
-        y_disc = y_disc.to(device)
+    for batch_idx, (data_WSI, data_omic,
+                    y_disc, event_time, censor) in enumerate(loader):
+
+        # 1) move to device
+        data_WSI   = data_WSI.to(device)
+        data_omic  = data_omic.to(device)
+        y_disc     = y_disc.to(device)
         event_time = event_time.to(device)
-        censor = censor.to(device)
-        #pdb.set_trace()
-        h = model(x_path=data_WSI, x_omic=data_omic) # return hazards, S, Y_hat, A_raw, results_dict
-        if not isinstance(h, tuple):
-            loss = loss_fn(h=h, y=y_disc, t=event_time, c=censor)
-            loss_value = loss.item()
-        else:
-            h_path, h_omic, h_mm = h
-            loss = 0.5*loss_fn(h=h_mm, y=y_disc, t=event_time, c=censor)
-            loss += 0.25*loss_fn(h=h_path, y=y_disc, t=event_time, c=censor)
-            loss += 0.25*loss_fn(h=h_omic, y=y_disc, t=event_time, c=censor)
-            loss_value = loss.item()
-            h = h_mm
+        censor     = censor.to(device)
 
-        if reg_fn is None:
-            loss_reg = 0
-        else:
-            loss_reg = reg_fn(model) * lambda_reg
+        # 2) forward
+        out = model(x_path=data_WSI, x_omic=data_omic)
 
+        # ---- unify to hazards, S, Y_hat ----
+        if not isinstance(out, tuple):                 # single tensor
+            hazards, S, Y_hat = out, None, None
+        elif len(out) == 5:                            # (hazards, S, Y_hat, A_raw, dict)
+            hazards, S, Y_hat = out[:3]
+        else:                                          # len==3 (h_path, h_omic, h_mm)
+            _, _, h_mm = out
+            hazards, S, Y_hat = h_mm, None, None
+
+        # 3) loss
+        loss = loss_fn(h=hazards, y=y_disc, t=event_time, c=censor)
+        loss_value = loss.item()
+
+        # 4) L1 reg (optional)
+        loss_reg = 0 if reg_fn is None else reg_fn(model) * lambda_reg
+
+        # 5) risk score for c-index
         if isinstance(loss_fn, NLLSurvLoss):
-            hazards = torch.sigmoid(h)
-            survival = torch.cumprod(1 - hazards, dim=1)
+            survival = torch.cumprod(1 - torch.sigmoid(hazards), dim=1)
             risk = -torch.sum(survival, dim=1).detach().cpu().numpy()
         else:
-            risk = h.detach().cpu().numpy().squeeze()
+            risk = hazards.detach().cpu().numpy().squeeze()
 
-        #pdb.set_trace()
-        #all_risk_scores[batch_idx] = risk
-        #all_censorships[batch_idx] = censor.detach().cpu().item()
-        #all_event_times[batch_idx] = event_time
+        # bookkeeping
+        train_loss_surv += loss_value
+        train_loss      += loss_value + loss_reg
         all_risk_scores.append(risk)
         all_censorships.append(censor.detach().cpu().numpy())
         all_event_times.append(event_time.detach().cpu().numpy())
-        #pdb.set_trace()
-        train_loss_surv += loss_value
-        train_loss += loss_value + loss_reg
 
-        if y_disc.shape[0] == 1 and (batch_idx + 1) % 100 == 0:
-            print('batch {}, loss: {:.4f}, label: {}, event_time: {:.4f}, risk: {:.4f}, bag_size: {}'.format(batch_idx, loss_value + loss_reg, y_disc.detach().cpu().item(), float(event_time.detach().cpu().item()), float(risk), data_WSI.size(0)))
-        elif y_disc.shape[0] != 1 and (batch_idx + 1) % 5 == 0:
-            print('batch {}, loss: {:.4f}, label: {}, event_time: {:.4f}, risk: {:.4f}, bag_size: {}'.format(batch_idx, loss_value + loss_reg, y_disc.detach().cpu()[0], float(event_time.detach().cpu()[0]), float(risk[0]), data_WSI.size(0)))
-        
-        # backward pass
-        loss = loss / gc + loss_reg
-        loss.backward()
-
-        if (batch_idx + 1) % gc == 0: 
+        # backward
+        (loss + loss_reg).div_(gc).backward()
+        if (batch_idx + 1) % gc == 0:
             optimizer.step()
             optimizer.zero_grad()
 
-    # calculate loss and error for epoch
+    # --- epoch-level metrics ---
     train_loss_surv /= len(loader)
-    train_loss /= len(loader)
-    #pdb.set_trace()
+    train_loss      /= len(loader)
 
     all_risk_scores = np.concatenate(all_risk_scores)
     all_censorships = np.concatenate(all_censorships)
     all_event_times = np.concatenate(all_event_times)
 
-    # c_index = concordance_index(all_event_times, all_risk_scores, event_observed=1-all_censorships) 
-    c_index = concordance_index_censored((1-all_censorships).astype(bool), all_event_times, all_risk_scores, tied_tol=1e-08)[0]
+    c_index = concordance_index_censored(
+        (1-all_censorships).astype(bool),
+        all_event_times,
+        all_risk_scores
+    )[0]
 
-    print('Epoch: {}, train_loss_surv: {:.4f}, train_loss: {:.4f}, train_c_index: {:.4f}'.format(epoch, train_loss_surv, train_loss, c_index))
+    print(f'Epoch {epoch}: loss_surv={train_loss_surv:.4f}, '
+          f'loss={train_loss:.4f}, c_index={c_index:.4f}')
 
     if writer:
         writer.add_scalar('train/loss_surv', train_loss_surv, epoch)
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('train/c_index', c_index, epoch)
+        writer.add_scalar('train/loss',      train_loss,      epoch)
+        writer.add_scalar('train/c_index',   c_index,         epoch)
 
 
-def validate_survival(cur, epoch, model, loader, n_classes, early_stopping=None, monitor_cindex=None, writer=None, loss_fn=None, reg_fn=None, lambda_reg=0., results_dir=None):
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def validate_survival(cur, epoch, model, loader, n_classes,
+                      early_stopping=None, monitor_cindex=None, writer=None,
+                      loss_fn=None, reg_fn=None, lambda_reg=0.,
+                      results_dir=None):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
+
     val_loss_surv, val_loss = 0., 0.
-    all_risk_scores = np.zeros((len(loader)))
-    all_censorships = np.zeros((len(loader)))
-    all_event_times = np.zeros((len(loader)))
+    all_risk_scores = np.zeros(len(loader))
+    all_censorships = np.zeros(len(loader))
+    all_event_times = np.zeros(len(loader))
 
-    for batch_idx, (data_WSI, data_omic, y_disc, event_time, censor) in enumerate(loader):
-        data_WSI, data_omic = data_WSI.to(device), data_omic.to(device)
-        y_disc = y_disc.to(device)
+    for batch_idx, (data_WSI, data_omic,
+                    y_disc, event_time, censor) in enumerate(loader):
+
+        # ─── 1. 送到设备 ──────────────────────────
+        data_WSI   = data_WSI.to(device)
+        data_omic  = data_omic.to(device)
+        y_disc     = y_disc.to(device)
         event_time = event_time.to(device)
-        censor = censor.to(device)
+        censor     = censor.to(device)
 
+        # ─── 2. 前向 (无梯度) ─────────────────────
         with torch.no_grad():
-            h = model(x_path=data_WSI, x_omic=data_omic) # return hazards, S, Y_hat, A_raw, results_dict
+            out = model(x_path=data_WSI, x_omic=data_omic)
 
-        if not isinstance(h, tuple):
-            loss = loss_fn(h=h, y=y_disc, t=event_time, c=censor)
-            loss_value = loss.item()
-        else:
-            h_path, h_omic, h_mm = h
-            loss = 0.5*loss_fn(h=h_mm, y=y_disc, t=event_time, c=censor)
-            loss += 0.25*loss_fn(h=h_path, y=y_disc, t=event_time, c=censor)
-            loss += 0.25*loss_fn(h=h_omic, y=y_disc, t=event_time, c=censor)
-            loss_value = loss.item()
-            h = h_mm
+        # ─── 3. 统一拆包 → hazards ────────────────
+        if not isinstance(out, tuple):                 # 单张量
+            hazards = out
+        elif len(out) == 5:                            # (hazards, S, Y_hat, A_raw, dict)
+            hazards = out[0]
+        else:                                          # len==3 → (h_path, h_omic, h_mm)
+            hazards = out[2]                           # 取融合分支 h_mm
 
-        if reg_fn is None:
-            loss_reg = 0
-        else:
-            loss_reg = reg_fn(model) * lambda_reg
+        # ─── 4. 损失 ─────────────────────────────
+        loss = loss_fn(h=hazards, y=y_disc, t=event_time, c=censor)
+        loss_value = loss.item()
 
+        # ─── 5. 正则 ─────────────────────────────
+        loss_reg = 0 if reg_fn is None else reg_fn(model) * lambda_reg
+
+        # ─── 6. 风险分数 (c-index 用) ──────────────
         if isinstance(loss_fn, NLLSurvLoss):
-            hazards = torch.sigmoid(h)
-            survival = torch.cumprod(1 - hazards, dim=1)
-            risk = -torch.sum(survival, dim=1).detach().cpu().numpy()
+            surv = torch.cumprod(1 - torch.sigmoid(hazards), dim=1)
+            risk = -torch.sum(surv, dim=1).detach().cpu().numpy()
         else:
-            risk = h.detach().cpu().numpy()
+            risk = hazards.detach().cpu().numpy().squeeze()
 
         all_risk_scores[batch_idx] = risk
         all_censorships[batch_idx] = censor.detach().cpu().numpy()
         all_event_times[batch_idx] = event_time.detach().cpu().numpy()
 
         val_loss_surv += loss_value
-        val_loss += loss_value + loss_reg
+        val_loss      += loss_value + loss_reg
 
+    # ─── 7. 计算 epoch 级指标 ─────────────────────
     val_loss_surv /= len(loader)
-    val_loss /= len(loader)
-    
-    c_index = concordance_index_censored((1-all_censorships).astype(bool), all_event_times, all_risk_scores, tied_tol=1e-08)[0]
+    val_loss      /= len(loader)
+
+    c_index = concordance_index_censored(
+        (1 - all_censorships).astype(bool),
+        all_event_times,
+        all_risk_scores,
+        tied_tol=1e-8
+    )[0]
 
     if writer:
         writer.add_scalar('val/loss_surv', val_loss_surv, epoch)
-        writer.add_scalar('val/loss', val_loss, epoch)
-        writer.add_scalar('val/c-index', c_index, epoch)
+        writer.add_scalar('val/loss',      val_loss,      epoch)
+        writer.add_scalar('val/c-index',   c_index,       epoch)
 
+    # ─── 8. Early-Stopping & c-index 监控 ─────────
     if early_stopping:
         assert results_dir
-        early_stopping(epoch, val_loss_surv, model, ckpt_name=os.path.join(results_dir, "s_{}_minloss_checkpoint.pt".format(cur)))
-        
+        early_stopping(epoch, val_loss_surv, model,
+                       ckpt_name=os.path.join(
+                           results_dir, f"s_{cur}_minloss_checkpoint.pt"))
         if early_stopping.early_stop:
             print("Early stopping")
             return True
+
+    if monitor_cindex:
+        monitor_cindex(c_index, model,
+                       ckpt_name=os.path.join(
+                           results_dir, f"s_{cur}_bestcidx_checkpoint.pt"))
 
     return False
 
@@ -405,8 +424,8 @@ def summary_survival(model, loader, n_classes):
         else:
             risk = h.detach().cpu().numpy().squeeze()
 
-        event_time = np.asscalar(event_time)
-        censor = np.asscalar(censor)
+        event_time = event_time.item()
+        censor = censor.item()
         all_risk_scores[batch_idx] = risk
         all_censorships[batch_idx] = censor
         all_event_times[batch_idx] = event_time

@@ -48,12 +48,15 @@ def collate_features(batch):
     return [img, coords]
 
 def collate_MIL_survival(batch):
-    img = torch.cat([item[0] for item in batch], dim = 0)
-    omic = torch.cat([item[1] for item in batch], dim = 0).type(torch.FloatTensor)
-    label = torch.LongTensor([item[2] for item in batch])
-    event_time = torch.FloatTensor([item[3] for item in batch])
-    c = torch.FloatTensor([item[4] for item in batch])
+    img  = torch.cat([b[0] for b in batch], 0)
+    omic = torch.cat([b[1] for b in batch], 0).float()
+
+    label = torch.LongTensor([int(b[2]) for b in batch])
+
+    event_time = torch.as_tensor([float(b[3]) for b in batch]).float()
+    c          = torch.as_tensor([float(b[4]) for b in batch]).float()
     return [img, omic, label, event_time, c]
+
 
 def collate_MIL_survival_cluster(batch):
     img = torch.cat([item[0] for item in batch], dim = 0)
